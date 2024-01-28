@@ -28,11 +28,11 @@ jobs:
 
       - name: Calculate image tags
         id: meta
-        run: echo "tags=$(git rev-parse --short HEAD),latest" >> $GITHUB_OUTPUT
+        run: echo "tags=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v4
         with:
           context: "{{defaultContext}}"
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tags }},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
