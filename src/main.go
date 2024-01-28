@@ -3,9 +3,9 @@ package main
 import (
 	"bytes"
 	_ "encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -14,39 +14,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lmittmann/tint"
 	"go.starlark.net/starlark"
 )
 
-type ProxyScript struct {
-	FilePath string
-	Script   starlark.StringDict
-	Thread   *starlark.Thread
-}
-
-func (script *ProxyScript) ExecuteModifyFunction(reqData map[string]string, respData map[string]string) (starlark.Value, error) {
-	arg1 := map2dict(reqData)
-	arg2 := map2dict(respData)
-	result, err := starlark.Call(script.Thread, script.Script["modify"], starlark.Tuple{arg1, arg2}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-	return result, err
-}
-
-func loadStarlakScript(filePath string) (*ProxyScript, error) {
-	thread := &starlark.Thread{Name: fmt.Sprintf("thead: %s", filePath)}
-	script, err := starlark.ExecFile(thread, filePath, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if !script.Has("modify") {
-		return nil, errors.New("no `modify` function defined")
-	}
-
-	return &ProxyScript{filePath, script, thread}, nil
-}
+var logger = slog.New(tint.NewHandler(os.Stderr, nil))
 
 var scripts []*ProxyScript
 
@@ -59,23 +31,26 @@ func main() {
 	source, err := url.Parse(sourceURL)
 
 	if err != nil {
-		fmt.Printf("Invalid SOURCE_URL: `%s`", sourceURL)
+		logger.Info("Invalid SOURCE_URL", "source_url", sourceURL)
 		return
 	}
 
 	port, err := strconv.Atoi(os.Getenv("PORT"))
 	if err != nil {
-		fmt.Printf("Please set the environment variable PORT to a valid integer")
-		return
+		port = 6350
 	}
 
 	scriptsDir := os.Getenv("SCRIPTS_DIR")
 	if len(scriptsDir) == 0 {
-		scriptsDir = "/etc/goprep/scripts"
+		scriptsDir = "/etc/goprep/scripts/"
 	}
+	if !strings.HasSuffix(scriptsDir, "/") {
+		scriptsDir += "/"
+	}
+
 	fObjs, err := os.ReadDir(scriptsDir)
 	if err != nil || len(fObjs) == 0 {
-		fmt.Printf("No scripts found in `%s`", scriptsDir)
+		logger.Error("No scripts found", "scripts_dir", scriptsDir)
 		return
 	}
 
@@ -86,29 +61,39 @@ func main() {
 	}
 	sort.Strings(files)
 
-	scripts = make([]*ProxyScript, len(files))
+	scripts = make([]*ProxyScript, 0, len(files))
 
 	for _, fname := range files {
+		if len(fname) == 0 {
+			continue
+		}
 		if strings.HasSuffix(fname, ".star") {
-			filePath := scriptsDir + "/" + fname
+			filePath := scriptsDir + fname
 
 			compiled, err := loadStarlakScript(filePath)
 			if err != nil {
-				fmt.Printf("Error loading or compiling script %s: %v\n", filePath, err)
+				logger.Error("Error loading or compiling script", "file_path", filePath, "error", err)
 				continue
 			}
 
 			scripts = append(scripts, compiled)
-			fmt.Printf("Script %s loaded and compiled successfully\n", filePath)
+			logger.Info("Script loaded and compiled successfully", "file_path", filePath)
 		} else {
-			fmt.Printf("Skipping file %s (not a .star file)\n", fname)
+			logger.Debug("Skipping file (not a .star file)", "file_path", fname)
 		}
 	}
 
 	// setup the proxy
 	//
 
-	proxy := httputil.NewSingleHostReverseProxy(source)
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(source)
+			r.Out.Host = r.In.Host // if desired
+		},
+	}
+
+	//proxy := httputil.NewSingleHostReverseProxy(source)
 
 	proxy.ModifyResponse = modifyResponse
 
@@ -119,9 +104,11 @@ func main() {
 	// run
 	//
 
+	logger.Info("listening to requests", "port", port)
+
 	err = http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
 	if err != nil {
-		fmt.Println(err)
+		logger.Error("error starting server", "error", err)
 	}
 }
 
@@ -137,15 +124,23 @@ func modifyResponse(resp *http.Response) (err error) {
 	bodyIsSet := false
 	reqData := make(map[string]string)
 	respData := make(map[string]string)
+
+	headerOverride := make(map[string]string)
+
+	clearMap(reqData)
+	clearMap(respData)
+	httpRequestToMap(resp.Request, reqData)
+	httpResponseToMap(resp, respData)
+
+	//origBody := make([]byte, 0)
+	origBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	respData["Body"] = string(origBody)
 	for _, script := range scripts {
-		clearMap(reqData)
-		clearMap(respData)
-		httpRequestToMap(resp.Request, reqData)
-		httpResponseToMap(resp, respData)
 
 		r, err := script.ExecuteModifyFunction(reqData, respData)
 		if err != nil {
-			// TODO report
+			logger.Error("Error executing script", "error", err)
 			continue
 		}
 		result := r.(*starlark.Dict)
@@ -153,81 +148,34 @@ func modifyResponse(resp *http.Response) (err error) {
 		bodyValue, found, _ := result.Get(starlark.String("body"))
 		if found {
 			bodyIsSet = true
-			body = bodyValue.String()
+			body, _ = strconv.Unquote(bodyValue.String())
 		}
 
 		headersValue, found, _ := result.Get(starlark.String("headers"))
 		if found {
+			//logger.Info("found headers: %+v", headersValue)
 			headers := headersValue.(*starlark.Dict)
 			for _, item := range headers.Items() {
-				k := item.Index(0).String()
-				v := item.Index(1).String()
-				resp.Header.Set(k, v)
+				k, _ := strconv.Unquote(item.Index(0).String())
+				v, _ := strconv.Unquote(item.Index(1).String())
+				headerOverride[k] = v
 			}
 		}
 	}
+
+	for k, v := range headerOverride {
+		logger.Debug("setting header", "name", k, "value", v)
+		resp.Header.Set(k, v)
+		resp.Header.Set(k, v)
+	}
+	//logger.Info("response headers now are: %+v", resp.Header)
+
 	if bodyIsSet {
 		resp.Body = io.NopCloser(bytes.NewReader([]byte(body)))
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	} else {
+		resp.Body = io.NopCloser(bytes.NewReader([]byte(origBody)))
 	}
 
 	return nil
-}
-
-func httpRequestToMap(request *http.Request, reqData map[string]string) {
-
-	reqData["Method"] = request.Method
-	reqData["URL"] = request.URL.String()
-	reqData["Proto"] = request.Proto
-	reqData["ProtoMajor"] = fmt.Sprintf("%d", request.ProtoMajor)
-	reqData["ProtoMinor"] = fmt.Sprintf("%d", request.ProtoMinor)
-
-	for key, values := range request.Header {
-		reqData[fmt.Sprintf("Header_%s", key)] = fmt.Sprintf("%v", values)
-	}
-
-	reqData["ContentLength"] = fmt.Sprintf("%d", request.ContentLength)
-	reqData["TransferEncoding"] = fmt.Sprintf("%v", request.TransferEncoding)
-	reqData["Host"] = request.Host
-	reqData["Form"] = fmt.Sprintf("%v", request.Form)
-	reqData["PostForm"] = fmt.Sprintf("%v", request.PostForm)
-	reqData["MultipartForm"] = fmt.Sprintf("%v", request.MultipartForm)
-	reqData["Trailer"] = fmt.Sprintf("%v", request.Trailer)
-	reqData["RemoteAddr"] = request.RemoteAddr
-	reqData["RequestURI"] = request.RequestURI
-	reqData["TLS"] = fmt.Sprintf("%v", request.TLS)
-}
-
-func httpResponseToMap(resp *http.Response, respData map[string]string) {
-
-	respData["Status"] = resp.Status
-	respData["StatusCode"] = fmt.Sprintf("%d", resp.StatusCode)
-	respData["Proto"] = resp.Proto
-	respData["ProtoMajor"] = fmt.Sprintf("%d", resp.ProtoMajor)
-	respData["ProtoMinor"] = fmt.Sprintf("%d", resp.ProtoMinor)
-
-	for key, values := range resp.Header {
-		respData[fmt.Sprintf("Header_%s", key)] = fmt.Sprintf("%v", values)
-	}
-
-	respData["ContentLength"] = fmt.Sprintf("%d", resp.ContentLength)
-	respData["TransferEncoding"] = fmt.Sprintf("%v", resp.TransferEncoding)
-	respData["Uncompressed"] = fmt.Sprintf("%v", resp.Uncompressed)
-	respData["Request"] = fmt.Sprintf("%v", resp.Request)
-	respData["TLS"] = fmt.Sprintf("%v", resp.TLS)
-}
-
-func map2dict(goMap map[string]string) *starlark.Dict {
-	var err error
-	dict := starlark.NewDict(len(goMap))
-	for key, value := range goMap {
-		k := starlark.String(key)
-		v := starlark.String(value)
-		err = dict.SetKey(k, v)
-		if err != nil {
-			fmt.Printf("error making dict: %+v\n", err)
-			panic("starlak VM is unusable, aborting")
-		}
-	}
-	return dict
 }
